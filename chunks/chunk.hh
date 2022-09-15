@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <ostream>
 
-constexpr size_t chunk_size = 1000; //1k bytes, as requested in task desc
+constexpr size_t chunk_size = 1024; //1k bytes, as requested in task desc
 
 struct Chunk
 {

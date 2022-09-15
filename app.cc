@@ -36,6 +36,8 @@
 #include <seastar/util/log.hh>
 #include <seastar/util/tmp_file.hh>
 
+#include "chunks/scoped_timer.hh"
+
 using namespace seastar;
 
 namespace {
@@ -90,11 +92,10 @@ int main(int ac, char** av) {
         applog.info("[main] - "
                     "config chunkSize:{}bytes",chunk_size);
         applog.info("[main] - "
-                    "config maxBlockSize:{}bytes ({}chunks)", toBytes(maxChunksInGroup), maxChunksInGroup);
-        applog.info("[main] - "
                     "output file '{}'", outputFileName);
         applog.info("[main] - "
                     "cores '{}'", seastar::smp::count);
+
         return seastar::async( [inputFileName,outputFileName]{
 
             if( not log_info_about_input_file(inputFileName).get0() )
@@ -104,7 +105,10 @@ int main(int ac, char** av) {
 
             std::vector<FileWithSortedChunks> sortedFiles;
 
-            seastar::parallel_for_each(boost::irange<unsigned>(0, seastar::smp::count),[inputFileName,&sortedFiles] (unsigned cpu) {
+            //step1
+            {
+            ScopedTime t("step1");
+            seastar::parallel_for_each(boost::irange<unsigned>(0, seastar::smp::count),[=,&sortedFiles] (unsigned cpu) {
                 return seastar::smp::submit_to(cpu, [=, &sortedFiles](){
                     return sort_part_of_input_file(inputFileName, cpu, seastar::smp::count).then([&sortedFiles](const FileWithSortedChunks& fileName){
                         sortedFiles.push_back(fileName);
@@ -115,12 +119,17 @@ int main(int ac, char** av) {
 
             for(auto &i: sortedFiles)
                 applog.info("OUT file:{} {}chunks",i.fileName, (i.range.last-i.range.first) );
+            }
 
+            //step2
+            {
+            ScopedTime t("step2");
             applog.info("[main] - "
                         "merging sorted {}files", sortedFiles.size());
             sorted_files_open (sortedFiles).wait();
             sorted_files_merge(sortedFiles, outputFileName).wait();
             sorted_files_close_and_remove(sortedFiles).wait();
+            }
         });
     });
 }

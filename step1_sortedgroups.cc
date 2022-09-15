@@ -1,4 +1,6 @@
 #include <seastar/core/with_scheduling_group.hh>
+#include <seastar/core/memory.hh>
+#include "chunks/scoped_timer.hh"
 
 //This module creates sorted file
 //
@@ -11,27 +13,23 @@
 // YYYY
 using namespace seastar;
 
+#include "config.hh"
 
-const ChunkOffset maxChunksInGroup = 1000;
-const float scheduling_group_shares = 100.0f;
+logger step1log("step1");
 
 // this function generates (sorted groups of chunks) in temporary part of file
 //
 // fIn - input file
 // range - range to sort in fIn
 // fOut - where to save data
-future<> groupsort_chunks(file fIn, Range range, file fOut, seastar::scheduling_group sg)
+future<> groupsort_chunks(file fIn, file fOut, Range range, std::vector<Range> &groupRanges, unsigned numOfChunks)
 {
-    auto attr = seastar::thread_attributes();
-    attr.sched_group = sg;
-
-    ChunkOffset numOfChunks  = range.last-range.first;
-
-    return parallel_for_each(
-        splitIntoRangs(numOfChunks, maxChunksInGroup, range.first),
+    return max_concurrent_for_each(
+        groupRanges,
+        max_concurent,
         [=] (Range subRange) {
-        return seastar::with_scheduling_group(sg, [=] {
             return seastar::async([=] {
+
                 ChunkOffset len = (subRange.last-subRange.first);
                 ChunkOffset relPos = (subRange.first-range.first);
 
@@ -41,8 +39,29 @@ future<> groupsort_chunks(file fIn, Range range, file fOut, seastar::scheduling_
 
                 auto rbuf = temporary_buffer<char>::aligned(chunk_size, toBytes(len));
                 chunks_read(rbuf, fIn, subRange.first, len).wait();
+                thread::maybe_yield();
+
                 chunks_sort(rbuf, len).wait();
+                thread::maybe_yield();
+
                 chunks_write(rbuf, fOut, fOffsetWrite, len).wait();
+            });
+        });
+}
+
+// this function generates sorted chunks in first part of FILE (based on temporary part of file)
+//
+// f - file with (groups of chunks)
+// this will append 'f' with sorted list of chunks build from (groups of chunks)
+future<> groupsort_merge_small(file f, Range range, std::vector<Range> &groupRanges, unsigned numOfChunks)
+{
+    //there is only one group - move it to  begining of file
+    return do_with( temporary_buffer<char>::aligned(chunk_size, toBytes(numOfChunks) ),//rbuf
+                    [f,numOfChunks] (auto& rbuf) mutable
+    {
+        return chunks_read(rbuf, f, numOfChunks, numOfChunks).then([f, numOfChunks, &rbuf] () mutable {
+            return chunks_write(rbuf, f, 0, numOfChunks).then([](){
+                return make_ready_future<>();
             });
         });
     });
@@ -52,61 +71,27 @@ future<> groupsort_chunks(file fIn, Range range, file fOut, seastar::scheduling_
 //
 // f - file with (groups of chunks)
 // this will append 'f' with sorted list of chunks build from (groups of chunks)
-future<> groupsort_merge(file f, Range range)
+future<> groupsort_merge_big(file f, Range range, std::vector<Range> &groupRanges, unsigned numOfChunks)
 {
-    ChunkOffset numOfChunks = range.last-range.first;
-
-    //there is only one group - move it to  begining of file
-    if(numOfChunks <= maxChunksInGroup)
-    {
-        applog.info("[merge] - "
-                    "moving tmp to begining");
-        return do_with( temporary_buffer<char>::aligned(chunk_size, toBytes(numOfChunks) ),//rbuf
-                        [f,numOfChunks] (auto& rbuf) mutable
-        {
-            return chunks_read(rbuf, f, numOfChunks, numOfChunks).then([f, numOfChunks, &rbuf] () mutable {
-                return chunks_write(rbuf, f, 0, numOfChunks).then([](){
-                    return make_ready_future<>();
-                });
-            });
-        });
-    }
+    std::vector<FileWithSortedChunks> fileWithRanges;
+    fileWithRanges.reserve(groupRanges.size());
+    //convert ranges to FileWithSortedChunks
+    for(auto& range: groupRanges)
+        fileWithRanges.push_back(
+            FileWithSortedChunks{
+                "",//filename
+                range,
+                f
+            }
+        );
 
     //must merge groups into one
-    return seastar::async( [f, numOfChunks]() mutable {
-
-        std::vector<Range> ranges = splitIntoRangs(numOfChunks, maxChunksInGroup, numOfChunks);//all blocks start from middle of this file
-        applog.info("[merge] - "
-                    "merging groups:");
-        for(auto& r: ranges)
-            applog.info("[merge] - "
-                        "group {:010}...{:010} {}chunks", r.first, r.last, (r.last-r.first));
-
-        std::vector<FileWithSortedChunks> fileWithRanges;
-        fileWithRanges.reserve(ranges.size());
-        //convert ranges to FileWithSortedChunks
-        {
-            for(auto& range: ranges)
-                fileWithRanges.push_back(
-                    FileWithSortedChunks{
-                        "",//filename
-                        range,
-                        f
-                    }
-                );
-
-            ranges.clear();
-        }
-
-        //sort
-        chunk_sort_ranges(fileWithRanges, f).wait();
-    });
+    return chunk_sort_ranges(fileWithRanges, f);
 }
 
 //discard temporaty part of file
-future<> groupsort_cleanup(file f, Range range)
+future<> groupsort_cleanup(file f, unsigned numOfChunks)
 {
-    const unsigned numOfChunks = range.last-range.first;
     return f.truncate( toBytes(numOfChunks) );
 }
 
@@ -114,6 +99,8 @@ future<> groupsort_cleanup(file f, Range range)
 future<FileWithSortedChunks> sort_part_of_input_file(std::string inputFilename, unsigned workerId, unsigned workersNum)
 {
     std::string outFileName = "shard."+std::to_string(workerId)+".sorted";
+    std::string workerName = "Step1worker"+std::to_string(workerId);
+    const size_t maxMemPerWorker = seastar::memory::free_memory()*max_memory_percentage/workersNum;
 
     return with_file(open_file_dma(outFileName, open_flags::rw | open_flags::create | open_flags::truncate),
                      [=] (file& fOut) mutable {
@@ -130,25 +117,42 @@ future<FileWithSortedChunks> sort_part_of_input_file(std::string inputFilename, 
                         range.last += numOfChunksInFile % workersNum;
 
                     unsigned numOfChunks = (range.last-range.first);
-                    applog.info("[sort-shard] - "
-                                "{:010}...{:010} {}chunks",
+                    step1log.info("{} - will work on "
+                                "{:010}...{:010} {}chunks", workerName,
                                 range.first, range.last,
                                 numOfChunks);
 
-                    applog.info("[sort-shard] - "
-                                "generate groups");
+                    const size_t maxChunksInGroupBasedOnFreeMem = maxMemPerWorker/chunk_size * chunk_size / max_concurent;
+                    std::vector<Range> groupsRanges = splitIntoRangs(numOfChunks, maxChunksInGroupBasedOnFreeMem, range.first);
 
-                    auto sheduleGroup = seastar::create_scheduling_group("sg100"+std::to_string(workerId), scheduling_group_shares).get0();
-                    groupsort_chunks(fIn, range, fOut, sheduleGroup).wait();
-                    seastar::destroy_scheduling_group(sheduleGroup).get();
+                    for(auto& r: groupsRanges)
+                        step1log.info("{} - "
+                                    "group {:010}...{:010} {}chunks", workerName, r.first, r.last, (r.last-r.first));
 
-                    applog.info("[sort-shard] - "
-                                "merging groups");
-                    groupsort_merge(fOut, range).wait();
+                    {
+                    ScopedTime t(workerName+" - "
+                                 "groupsort_chunks");
+                    groupsort_chunks(fIn, fOut, range, groupsRanges, numOfChunks).wait();
+                    }
 
-                    applog.info("[sort-shard] - "
-                                "cleanup");
-                    groupsort_cleanup(fOut, range).wait();
+                    {
+                        if(groupsRanges.size()==1)
+                        {
+                            ScopedTime t(workerName+" - "
+                                        "merging groups (small)");
+                            groupsort_merge_small(fOut, range, groupsRanges, numOfChunks).wait();
+                        }else{
+                            ScopedTime t(workerName+" - "
+                                        "merging groups (big)");
+                            groupsort_merge_big(fOut, range, groupsRanges, numOfChunks).wait();
+                        }
+                    }
+
+                    {
+                    ScopedTime t(workerName+" - "
+                                 "cleanup");
+                    groupsort_cleanup(fOut, numOfChunks).wait();
+                    }
                     return numOfChunks;
 
                 }).then( [outFileName](unsigned numOfChunks){

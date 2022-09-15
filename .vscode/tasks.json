@@ -4,10 +4,40 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "build&run",
+            "label": "build",
             "type": "shell",
-            "command": "make app && ./app --input_file=largefile.bin --output_file=largefile.sorted -c4",
+            "command": "touch app.cc && make app && echo DONE; echo -ne '\007';",// && ./app --input_file=largefile.bin --output_file=largefile.sorted -c2",
             "group": "build",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel":"dedicated",
+                "showReuseMessage": true,
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "run",
+            "type": "shell",
+            "command": "./app --input_file=largefile.bin --output_file=largefile.sorted -c4; echo -ne '\007';",
+            "group": "test",
+            "presentation": {
+                "echo": true,
+                "reveal": "always",
+                "focus": false,
+                "panel":"dedicated",
+                "showReuseMessage": true,
+                "clear": true
+            },
+            "problemMatcher": []
+        },
+        {
+            "label": "create input (1GB) (1024b chunks)",
+            "type": "shell",
+            "command": "dd if=/dev/urandom of=largefile.bin bs=1024 count=1048576 && ls -lh largefile.bin",
+            "group": "none",
             "presentation": {
                 "echo": true,
                 "reveal": "always",
@@ -17,6 +47,7 @@
                 "clear": true
             },
             "problemMatcher": []
-        }
+        },
+
     ]
 }
